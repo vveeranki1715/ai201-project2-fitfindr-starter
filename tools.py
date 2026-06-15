@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -69,8 +70,47 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Tokenize the description into lowercase keywords.
+    keywords = [w for w in re.findall(r"[a-z0-9]+", (description or "").lower()) if len(w) > 1]
+
+    scored = []
+    for item in listings:
+        # 1. Price filter (inclusive).
+        if max_price is not None and item.get("price", float("inf")) > max_price:
+            continue
+
+        # 2. Size filter (case-insensitive substring so "M" matches "S/M").
+        if size:
+            item_size = str(item.get("size", "")).lower()
+            if size.lower() not in item_size:
+                continue
+
+        # 3. Score by keyword overlap against the searchable text fields.
+        haystack = " ".join(
+            str(x).lower()
+            for x in (
+                item.get("title", ""),
+                item.get("description", ""),
+                item.get("category", ""),
+                " ".join(item.get("style_tags", [])),
+                " ".join(item.get("colors", [])),
+                item.get("brand") or "",
+            )
+        )
+        score = sum(1 for kw in keywords if kw in haystack)
+
+        # 4. Drop listings with no keyword overlap. If no keywords were given,
+        #    keep everything that passed the filters (score stays 0 → keep).
+        if keywords and score == 0:
+            continue
+
+        scored.append((score, item))
+
+    # 5. Sort by score, highest first (stable — preserves dataset order on ties).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +140,56 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_desc = (
+        f"{new_item.get('title', 'an item')} "
+        f"({new_item.get('category', '')}, "
+        f"colors: {', '.join(new_item.get('colors', [])) or 'n/a'}, "
+        f"style: {', '.join(new_item.get('style_tags', [])) or 'n/a'})"
+    )
+
+    items = (wardrobe or {}).get("items", [])
+
+    if not items:
+        # Empty-wardrobe branch: general styling advice, no owned pieces to name.
+        prompt = (
+            f"A shopper is considering this secondhand item:\n{item_desc}\n\n"
+            "They have not entered any wardrobe items yet. Give friendly, general "
+            "styling advice in 2-4 sentences: what kinds of pieces (tops/bottoms/"
+            "shoes/layers) pair well with it, what vibe it suits, and one concrete "
+            "outfit idea using common staples. Do not invent specific items they own."
+        )
+    else:
+        wardrobe_lines = "\n".join(
+            f"- {it.get('name', 'item')} "
+            f"({it.get('category', '')}; {', '.join(it.get('colors', []))})"
+            for it in items
+        )
+        prompt = (
+            f"A shopper is considering this secondhand item:\n{item_desc}\n\n"
+            f"Here is their existing wardrobe:\n{wardrobe_lines}\n\n"
+            "Suggest 1-2 complete outfits that pair the new item with specific pieces "
+            "named from their wardrobe above. Be concrete (name the pieces) and add a "
+            "quick styling tip (tuck, cuff, layer). Keep it to 2-4 sentences."
+        )
+
+    try:
+        client = _get_groq_client()
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a sharp, friendly personal stylist."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        # Never crash the planning loop — return a usable fallback string.
+        return (
+            f"Style the {new_item.get('title', 'piece')} simply: balance its proportions "
+            f"with a fitted counterpart, keep the palette tonal, and let it be the focal "
+            f"point. (styling service unavailable: {exc})"
+        )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +221,40 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty / whitespace-only outfit string.
+    if not outfit or not outfit.strip():
+        return (
+            "Can't make a fit card without an outfit suggestion — "
+            "try a different search so we have a look to caption."
+        )
+
+    title = new_item.get("title", "this find")
+    price = new_item.get("price", "?")
+    platform = new_item.get("platform", "online")
+
+    prompt = (
+        f"Write a short, casual OOTD-style caption (2-4 sentences) for a social post "
+        f"about a thrifted find.\n\n"
+        f"Item: {title}\nPrice: ${price}\nPlatform: {platform}\n"
+        f"The styled look: {outfit}\n\n"
+        "Make it sound like a real person posting, not a product description. "
+        "Mention the item name, the price, and the platform naturally (once each). "
+        "Capture the vibe of the outfit in specific terms. A tasteful emoji is fine."
+    )
+
+    try:
+        client = _get_groq_client()
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You write punchy, authentic thrift-haul captions."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.9,  # higher temp → captions vary between runs
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        return (
+            f"scored this {title} off {platform} for ${price} and i'm obsessed — "
+            f"styled it exactly how i wanted ✨ (caption service unavailable: {exc})"
+        )
